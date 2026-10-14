@@ -1,0 +1,962 @@
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 1fbda75..384d5d7 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -194,6 +194,7 @@ class BlockPool:
+         self.kv_event_queue: list[KVCacheEvent] = []
+ 
+         self.metrics_collector = metrics_collector
++        self.progressive_runtime = None
+ 
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+@@ -587,6 +588,8 @@ class BlockPool:
+             ):
+                 removed_hashes.append(block_hash)
+         block.reset_hash()
++        if self.progressive_runtime is not None:
++            self.progressive_runtime.on_remove(block, removed_hashes)
+         return removed_hashes
+ 
+     def _emit_block_removed_events(
+@@ -663,7 +666,11 @@ class BlockPool:
+         # In order to only iterate the list once, we duplicated code a bit
+         if self.enable_caching:
+             for block in ret:
++                if self.progressive_runtime is not None:
++                    self.progressive_runtime.on_native_recycle(block)
+                 self._maybe_evict_cached_block(block)
++                if self.progressive_runtime is not None:
++                    self.progressive_runtime.on_allocate(block)
+                 assert block.ref_cnt == 0
+                 block.ref_cnt += 1
+                 if self.metrics_collector:
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index ef9f8da..86ef15f 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -167,6 +167,7 @@ class KVCacheManager:
+         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+         self.block_pool = self.coordinator.block_pool
+         self.kv_cache_config = kv_cache_config
++        self.progressive_runtime = None
+ 
+         # Watermark: minimum number of KV cache blocks to keep free when
+         # admitting waiting/preempted requests, to avoid frequent preemptions.
+@@ -247,6 +248,8 @@ class KVCacheManager:
+         # (which happens when the request requires prompt logprobs
+         # or calls a pooling model with all pooling).
+         if not self.prefix_cache_lookup_enabled(request):
++            if self.progressive_runtime is not None:
++                self.progressive_runtime.on_lookup(request, 0)
+             return self.empty_kv_cache_blocks, 0, 0
+ 
+         # NOTE: When all tokens hit the cache, we must recompute the last token
+@@ -291,6 +294,8 @@ class KVCacheManager:
+         )
+ 
+         blocks = self.create_kv_cache_blocks(computed_blocks)
++        if self.progressive_runtime is not None:
++            self.progressive_runtime.on_lookup(request, num_new_computed_tokens)
+         return blocks, num_new_computed_tokens, shared_prefix_boundary
+ 
+     def get_computed_blocks_for_connector(
+diff --git a/vllm/v1/core/progressive_policy.py b/vllm/v1/core/progressive_policy.py
+new file mode 100644
+index 0000000..b3ec322
+--- /dev/null
++++ b/vllm/v1/core/progressive_policy.py
+@@ -0,0 +1,328 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Observed-prefix policy; all physical mutation is delegated to BlockPool."""
++
++from __future__ import annotations
++
++import math
++import time
++from collections import Counter
++from dataclasses import dataclass, field
++from typing import Protocol
++
++Copy = tuple[int, int]
++UNKNOWN_OWNER = "<unattributed>"
++
++
++class PoolAdapter(Protocol):
++    def copies(self, key: bytes) -> list[Copy]: ...
++    def check(self, key: bytes, expected: list[Copy]) -> str | None: ...
++    def evict(self, key: bytes, expected: list[Copy]) -> int: ...
++    def free_count(self) -> int: ...
++
++
++@dataclass
++class PrefixNode:
++    key: bytes
++    parent: bytes | None
++    depth: int
++    born_epoch: int
++    owners: set[str] = field(default_factory=set)
++    history_owners: set[str] = field(default_factory=set)
++    children: set[bytes] = field(default_factory=set)
++    copies: dict[int, int] = field(default_factory=dict)
++    last_access_epoch: int = -1
++    cold_streak: int = 0
++
++
++class ProgressivePolicy:
++    """Track committed history and trim only observed private terminal chains.
++
++    Keys include the engine prefix hash and cache group. Per-block heat makes
++    partial prefix visits equivalent to splitting a segment at the visit edge.
++    Ghost nodes retain history and session ownership after physical eviction.
++    """
++
++    def __init__(
++        self,
++        block_size: int,
++        mode: str = "native",
++        check_interval: int = 10,
++        first_ratio: float = 0.20,
++        later_ratio: float = 0.40,
++    ):
++        if mode not in {"native", "progressive"}:
++            raise ValueError("policy must be native or progressive")
++        if block_size < 1 or check_interval < 1:
++            raise ValueError("block size and check interval must be positive")
++        if not (0 < first_ratio <= 1 and 0 < later_ratio <= 1):
++            raise ValueError("ratios must be in (0, 1]")
++        self.block_size = block_size
++        self.mode = mode
++        self.check_interval = check_interval
++        self.first_ratio = first_ratio
++        self.later_ratio = later_ratio
++        self.reset()
++
++    def reset(self) -> None:
++        self.nodes: dict[bytes, PrefixNode] = {}
++        self.lookups: dict[str, int] = {}
++        self.finished: set[str] = set()
++        self.completed = 0
++        self.last_completed = 0
++        self.next_threshold = self.check_interval
++        self.epoch = 0
++        self.checkpoint = 0
++        self.totals = {
++            "active_logical": 0,
++            "active_physical": 0,
++            "native_logical": 0,
++            "native_physical": 0,
++        }
++
++    def observe_access(
++        self,
++        request_id: str,
++        session_id: str | None,
++        keys: list[bytes],
++        max_cacheable_tokens: int,
++    ) -> int:
++        """Record a first logical lookup, including misses to ghost contents."""
++        if request_id in self.lookups:
++            return self.lookups[request_id]
++        owner = session_id if session_id is not None else UNKNOWN_OWNER
++        history_blocks = 0
++        history_open = session_id is not None
++        parent = None
++        for key in keys:
++            node = self.nodes.get(key)
++            if (
++                history_open
++                and node is not None
++                and node.parent == parent
++                and owner in node.history_owners
++            ):
++                history_blocks += 1
++            else:
++                history_open = False
++            if node is not None:
++                node.owners.add(owner)
++                node.last_access_epoch = self.epoch
++                node.cold_streak = 0
++            parent = key
++        cap = max(0, max_cacheable_tokens // self.block_size) * self.block_size
++        history = min(history_blocks * self.block_size, cap)
++        self.lookups[request_id] = history
++        return history
++
++    def commit(
++        self,
++        request_id: str,
++        session_id: str | None,
++        keys: list[bytes],
++        copies: dict[bytes, list[Copy]],
++    ) -> None:
++        """Register only full blocks whose GPU execution has completed.
++
++        A logical node is committed even if its physical mapping has already
++        gone; it remains eligible history, never a fictitious resident entry.
++        """
++        owner = session_id if session_id is not None else UNKNOWN_OWNER
++        parent = None
++        for depth, key in enumerate(keys):
++            node = self.nodes.get(key)
++            if node is None:
++                node = PrefixNode(key, parent, depth, self.epoch)
++                self.nodes[key] = node
++                if parent is not None:
++                    self.nodes[parent].children.add(key)
++            elif node.parent != parent or node.depth != depth:
++                raise ValueError("prefix hash identity has conflicting ancestry")
++            node.owners.add(owner)
++            node.history_owners.add(owner)
++            # The adapter supplies all confirmed physical copies for this key.
++            # Existing copies remain until a native invalidation or reconcile.
++            node.copies.update(dict(copies.get(key, [])))
++            parent = key
++
++    def finish(self, request_id: str, success: bool) -> None:
++        """Count a normal request once; cancellation and preemption do not count."""
++        if request_id in self.finished:
++            return
++        self.finished.add(request_id)
++        if success:
++            self.completed += 1
++
++    def on_remove(
++        self,
++        block_id: int,
++        generation: int,
++        keys: list[bytes],
++        reason: str,
++    ) -> None:
++        """Forget old slot contents before a slot is used for another prefix."""
++        physical_removed = False
++        logical_removed = 0
++        for key in set(keys):
++            node = self.nodes.get(key)
++            if node is not None and node.copies.get(block_id) == generation:
++                del node.copies[block_id]
++                physical_removed = True
++                if not node.copies:
++                    logical_removed += 1
++        prefix = "active" if reason == "policy" else "native"
++        if reason in {"policy", "native"}:
++            # Include native eviction of provisional/unmanaged valid contents.
++            if physical_removed or keys:
++                self.totals[prefix + "_physical"] += 1
++            self.totals[prefix + "_logical"] += logical_removed
++
++    def maybe_check(self, adapter: PoolAdapter) -> dict | None:
++        """Run at most one check at a synchronous scheduler safe boundary."""
++        if self.completed < self.next_threshold:
++            return None
++        started = time.perf_counter()
++        merged = (self.completed - self.next_threshold) // self.check_interval + 1
++        self.next_threshold = (
++            self.completed // self.check_interval + 1
++        ) * self.check_interval
++        window_completed = self.completed - self.last_completed
++        self.last_completed = self.completed
++        self.checkpoint += 1
++        before = adapter.free_count()
++        skips: Counter[str] = Counter()
++        statuses: dict[bytes, str | None] = {}
++        live: set[bytes] = set()
++
++        ordered = sorted(self.nodes.values(), key=lambda node: node.depth)
++        for node in ordered:
++            actual = dict(adapter.copies(node.key))
++            if actual:
++                live.add(node.key)
++            stale = [
++                slot
++                for slot, generation in node.copies.items()
++                if actual.get(slot) != generation
++            ]
++            for slot in stale:
++                del node.copies[slot]
++            if stale:
++                skips["identity_mismatch"] += 1
++            status = adapter.check(node.key, list(node.copies.items()))
++            statuses[node.key] = status
++            if (
++                node.last_access_epoch == self.epoch
++                or node.born_epoch == self.epoch
++                or status == "active"
++            ):
++                node.cold_streak = 0
++            else:
++                node.cold_streak += 1
++
++        # Effective prefix is rebuilt after native reclamation, so a hole cannot
++        # masquerade as a retained contiguous hit. Even orphaned resident
++        # descendants still protect their ancestors from active trimming.
++        effective: set[bytes] = set()
++        descendant_live: set[bytes] = set()
++        live_children: dict[bytes, set[bytes]] = {}
++        for node in reversed(ordered):
++            if node.parent is not None and (
++                node.key in live or node.key in descendant_live
++            ):
++                descendant_live.add(node.parent)
++                live_children.setdefault(node.parent, set()).add(node.key)
++        for node in ordered:
++            if (
++                node.copies
++                and node.key in live
++                and (node.parent is None or node.parent in effective)
++            ):
++                effective.add(node.key)
++
++        segments: list[dict] = []
++        candidate_count = target_count = actual_count = physical_count = 0
++        for leaf in ordered:
++            if leaf.key not in effective or leaf.key in descendant_live:
++                continue
++            chain: list[PrefixNode] = []
++            node = leaf
++            while True:
++                if len(node.owners) != 1 or UNKNOWN_OWNER in node.owners:
++                    skips["shared_or_unattributed"] += 1
++                    break
++                if node.cold_streak <= 0:
++                    skips[statuses[node.key] or "accessed_or_birth_protected"] += 1
++                    break
++                if node.cold_streak != leaf.cold_streak:
++                    break
++                if node.owners != leaf.owners:
++                    break
++                chain.append(node)
++                if node.parent is None or node.parent not in effective:
++                    break
++                parent = self.nodes[node.parent]
++                if live_children.get(parent.key, set()) != {node.key}:
++                    break
++                node = parent
++            if not chain:
++                continue
++
++            n = len(chain)
++            candidate_count += n
++            ratio = self.first_ratio if leaf.cold_streak == 1 else self.later_ratio
++            target = min(n, math.ceil(ratio * n)) if self.mode == "progressive" else 0
++            target_count += target
++            removed = 0
++            stopped = None
++            for node in chain[:target]:
++                expected = list(node.copies.items())
++                stopped = adapter.check(node.key, expected)
++                if stopped is not None:
++                    skips[stopped] += 1
++                    break
++                count = adapter.evict(node.key, expected)
++                if count != len(expected) or not count:
++                    stopped = "execution_recheck_refused"
++                    skips[stopped] += 1
++                    break
++                if adapter.copies(node.key):
++                    raise AssertionError("hard eviction left a hittable duplicate")
++                # Production BlockPool calls on_remove. This fallback also lets
++                # a small independent adapter implement the protocol correctly.
++                for slot, generation in expected:
++                    if node.copies.get(slot) == generation:
++                        self.on_remove(slot, generation, [node.key], "policy")
++                removed += 1
++                physical_count += count
++            actual_count += removed
++            segments.append(
++                {
++                    "before": n,
++                    "target": target,
++                    "evicted": removed,
++                    "remaining": n - removed,
++                    "cold_streak": leaf.cold_streak,
++                    "stop_reason": stopped,
++                }
++            )
++
++        after = adapter.free_count()
++        if before != after:
++            raise AssertionError("pure invalidation changed allocatable block count")
++        event = {
++            "checkpoint": self.checkpoint,
++            "completed_requests": self.completed,
++            "window_completed": window_completed,
++            "merged_thresholds": merged,
++            "candidate_logical_blocks": candidate_count,
++            "target_logical_blocks": target_count,
++            "evicted_logical_blocks": actual_count,
++            "evicted_physical_blocks": physical_count,
++            "skip_reasons": dict(skips),
++            "segments": segments,
++            "free_before": before,
++            "free_after": after,
++            "duration_ms": (time.perf_counter() - started) * 1000,
++        }
++        self.epoch += 1
++        return event
+diff --git a/vllm/v1/core/progressive_runtime.py b/vllm/v1/core/progressive_runtime.py
+new file mode 100644
+index 0000000..35f66f5
+--- /dev/null
++++ b/vllm/v1/core/progressive_runtime.py
+@@ -0,0 +1,481 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in bridge between the experimental policy and synchronous V1 scheduling."""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import json
++import os
++import re
++import sys
++import time
++from pathlib import Path
++from typing import Any
++
++from vllm.v1.core.progressive_policy import ProgressivePolicy
++
++
++def parse_request_id(request_id: str) -> dict[str, Any] | None:
++    """Decode the replay marker while allowing vLLM's ID prefix and suffix."""
++    marker = re.search(r"pe1\.([A-Za-z0-9_-]+)", request_id)
++    if marker is None:
++        return None
++    encoded = marker.group(1)
++    # Completions add -<prompt-index>; InputProcessor then adds -<8 hex>.
++    for length in range(len(encoded), max(0, len(encoded) - 128), -1):
++        candidate = encoded[:length]
++        try:
++            raw = base64.urlsafe_b64decode(candidate + "=" * (-len(candidate) % 4))
++            value = json.loads(raw)
++            if (
++                isinstance(value, dict)
++                and set(value) == {"r", "s", "c"}
++                and base64.urlsafe_b64encode(raw).decode().rstrip("=") == candidate
++                and isinstance(value.get("r"), str)
++                and isinstance(value.get("s"), str)
++                and isinstance(value.get("c"), int)
++                and not isinstance(value["c"], bool)
++                and value["c"] >= 0
++            ):
++                return {
++                    "run_id": value["r"],
++                    "session_id": value["s"],
++                    "call_index": value["c"],
++                    "request_id": "pe1." + candidate,
++                }
++        except (ValueError, UnicodeError, TypeError):
++            continue
++    return None
++
++
++class BlockPoolAdapter:
++    """Validate all physical copies before using native eviction and queue APIs."""
++
++    def __init__(self, pool, block_size: int, generations=None, runtime=None):
++        self.pool = pool
++        self.block_size = block_size
++        self.generations = (
++            generations if generations is not None else [0] * len(pool.blocks)
++        )
++        self.runtime = runtime
++
++    def copies(self, key: bytes) -> list[tuple[int, int]]:
++        value = self.pool.cached_block_hash_to_block._cache.get(key)
++        if value is None:
++            return []
++        blocks = value.values() if isinstance(value, dict) else (value,)
++        return [(block.block_id, self.generations[block.block_id]) for block in blocks]
++
++    def check(self, key: bytes, expected_copies: list[tuple[int, int]]) -> str | None:
++        actual = self.copies(key)
++        if not actual:
++            return "not_resident"
++        for block_id, _ in actual:
++            block = self.pool.blocks[block_id]
++            if block.ref_cnt != 0:
++                return "active"
++        if sorted(actual) != sorted(expected_copies):
++            return "identity"
++        for block_id, generation in actual:
++            block = self.pool.blocks[block_id]
++            if block.is_null:
++                return "null"
++            if generation != self.generations[block_id] or block.block_hash != key:
++                return "identity"
++            if self.pool.cached_block_hashes_by_block.get(block_id):
++                return "alias"
++            length = block.block_hash_num_tokens
++            if not length or length % self.block_size:
++                return "partial"
++            previous = block.prev_free_block
++            following = block.next_free_block
++            if (
++                previous is None
++                or following is None
++                or previous.next_free_block is not block
++                or following.prev_free_block is not block
++            ):
++                return "not_free"
++        return None
++
++    def evict(self, key: bytes, expected_copies: list[tuple[int, int]]) -> int:
++        if self.check(key, expected_copies) is not None:
++            return 0
++        blocks = [self.pool.blocks[block_id] for block_id, _ in expected_copies]
++        free_before = self.free_count()
++        if self.runtime is not None:
++            self.runtime._remove_reason = "policy"
++        try:
++            self.pool.evict_blocks({block.block_id for block in blocks})
++        finally:
++            if self.runtime is not None:
++                self.runtime._remove_reason = "reset"
++        if self.copies(key):
++            raise RuntimeError("Progressive eviction left a physical hash copy live")
++        for block in blocks:
++            self.pool.free_block_queue.remove(block)
++        self.pool.free_block_queue.prepend_n(blocks)
++        if self.free_count() != free_before:
++            raise RuntimeError("Progressive eviction changed free block capacity")
++        return len(blocks)
++
++    def free_count(self) -> int:
++        return self.pool.get_num_free_blocks()
++
++
++def _keys(request, count: int | None = None) -> list[bytes]:
++    hashes = request.block_hashes if count is None else request.block_hashes[:count]
++    return [bytes(block_hash) + b"\0\0\0\0" for block_hash in hashes]
++
++
++class ProgressiveRuntime:
++    """Buffer request/checkpoint logs and keep GPU execution evidence separate."""
++
++    def __init__(self, scheduler, config: dict[str, Any]):
++        self.scheduler = scheduler
++        self.pool = scheduler.kv_cache_manager.block_pool
++        self.config = config
++        self.block_size = config["block_size"]
++        self.generations = [0] * len(self.pool.blocks)
++        self.adapter = BlockPoolAdapter(
++            self.pool, self.block_size, self.generations, self
++        )
++        self.policy = ProgressivePolicy(
++            block_size=self.block_size,
++            mode=config["mode"],
++            check_interval=config["check_interval"],
++            first_ratio=config["first_cold_ratio"],
++            later_ratio=config["later_cold_ratio"],
++        )
++        self.requests: dict[str, dict[str, Any]] = {}
++        self._remove_reason = "reset"
++        self.log_dir = Path(config["log_dir"])
++        self.log_dir.mkdir(parents=True, exist_ok=True)
++        config_path = self.log_dir / "run_config.json"
++        if config_path.exists():
++            raise ValueError(
++                "VLLM_PE_LOG_DIR already contains a run; choose a new path"
++            )
++        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
++        self.files = {
++            name: (self.log_dir / name).open("a", buffering=65536)
++            for name in ("requests.jsonl", "policy_checks.jsonl", "reset.jsonl")
++        }
++        print(
++            "[progressive-eviction] " + json.dumps(config, ensure_ascii=False),
++            flush=True,
++        )
++
++    def _write(self, name: str, record: dict[str, Any]) -> None:
++        stream = self.files[name]
++        stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
++        stream.flush()
++
++    def _state(self, request) -> dict[str, Any]:
++        state = self.requests.get(request.request_id)
++        if state is not None:
++            return state
++        marker = parse_request_id(request.request_id)
++        if marker is not None and marker["run_id"] != self.config["run_id"]:
++            raise ValueError("Replay request run_id does not match VLLM_PE_RUN_ID")
++        if getattr(request, "resumable", False):
++            raise ValueError("Progressive prototype does not support streaming input")
++        params = request.sampling_params
++        if params is not None and getattr(params, "n", 1) != 1:
++            raise ValueError("Progressive replay requires one output per request")
++        state = {
++            "request_id": marker["request_id"] if marker else request.request_id,
++            "engine_request_id": request.request_id,
++            "session_id": marker["session_id"] if marker else None,
++            "call_index": marker["call_index"] if marker else None,
++            "run_id": self.config["run_id"],
++            "input_tokens": request.num_prompt_tokens,
++            "historical_prefix_tokens": 0,
++            "first_lookup_hit_tokens": None,
++            "adopted_prefix_hit_tokens": None,
++            "actual_prefix_hit_tokens": None,
++            "historical_cache_hit_tokens": None,
++            "committed_blocks": 0,
++            "admissions": 0,
++            "executed": False,
++            "finished": False,
++            "lookup_observed": False,
++        }
++        self.requests[request.request_id] = state
++        return state
++
++    def on_lookup(self, request, hit_tokens: int) -> None:
++        state = self._state(request)
++        if state["lookup_observed"]:
++            return
++        state["lookup_observed"] = True
++        state["first_lookup_hit_tokens"] = hit_tokens
++        state["historical_prefix_tokens"] = self.policy.observe_access(
++            request.request_id,
++            state["session_id"],
++            _keys(request),
++            max(0, request.num_prompt_tokens - 1),
++        )
++
++    def on_admit(self, request, hit_tokens: int) -> None:
++        state = self._state(request)
++        state["admissions"] += 1
++        if state["admissions"] > 1:
++            state["committed_blocks"] = 0
++        if state["adopted_prefix_hit_tokens"] is None:
++            state["adopted_prefix_hit_tokens"] = hit_tokens
++
++    def on_computed(self, request, blocks, computed_tokens: int) -> None:
++        state = self._state(request)
++        if not state["executed"]:
++            state["executed"] = True
++            adopted = state["adopted_prefix_hit_tokens"] or 0
++            state["actual_prefix_hit_tokens"] = adopted
++            state["historical_cache_hit_tokens"] = min(
++                adopted, state["historical_prefix_tokens"]
++            )
++        count = max(0, computed_tokens) // self.block_size
++        if count <= state["committed_blocks"]:
++            return
++        keys = _keys(request, count)
++        if len(keys) != count or len(blocks) != 1 or len(blocks[0]) < count:
++            raise RuntimeError(
++                "Executed prefix does not match the single-group block table"
++            )
++        copies = {}
++        for key, block in zip(keys, blocks[0][:count]):
++            if block.is_null or block.block_hash != key:
++                raise RuntimeError("Executed full block has unexpected hash identity")
++            copies[key] = self.adapter.copies(key)
++        self.policy.commit(request.request_id, state["session_id"], keys, copies)
++        state["committed_blocks"] = count
++
++    def on_finish(self, request) -> None:
++        state = self._state(request)
++        if state["finished"]:
++            return
++        state["finished"] = True
++        status = request.status.name
++        success = status in ("FINISHED_STOPPED", "FINISHED_LENGTH_CAPPED")
++        self.policy.finish(request.request_id, success)
++        self._write(
++            "requests.jsonl",
++            {
++                **{
++                    key: value
++                    for key, value in state.items()
++                    if key != "lookup_observed"
++                },
++                "output_tokens": len(request.output_token_ids),
++                "history_reusable_tokens": state["historical_prefix_tokens"],
++                "adopted_hit_tokens": state["historical_cache_hit_tokens"],
++                "success": success,
++                "status": status,
++                "preemptions": request.num_preemptions,
++                "timestamp": time.monotonic(),
++            },
++        )
++        self._save_totals()
++
++    def maybe_check(self) -> None:
++        if self.scheduler.deferred_frees or any(
++            request.num_in_flight_tokens for request in self.scheduler.requests.values()
++        ):
++            raise RuntimeError("Progressive check reached a boundary with in-flight KV")
++        event = self.policy.maybe_check(self.adapter)
++        if event is not None:
++            self._write(
++                "policy_checks.jsonl", {"run_id": self.config["run_id"], **event}
++            )
++            self._save_totals()
++
++    def on_remove(self, block, removed_hashes) -> None:
++        if removed_hashes:
++            self.policy.on_remove(
++                block.block_id,
++                self.generations[block.block_id],
++                list(removed_hashes),
++                self._remove_reason,
++            )
++
++    def on_native_recycle(self, block) -> None:
++        self._remove_reason = "native"
++
++    def on_allocate(self, block) -> None:
++        self.generations[block.block_id] += 1
++        self._remove_reason = "reset"
++
++    def _save_totals(self) -> None:
++        destination = self.log_dir / "eviction_summary.json"
++        temporary = destination.with_suffix(".tmp")
++        temporary.write_text(json.dumps(self.policy.totals, indent=2) + "\n")
++        temporary.replace(destination)
++
++    def reset(self) -> None:
++        self.policy.reset()
++        self.requests.clear()
++        self._write(
++            "reset.jsonl",
++            {
++                "run_id": self.config["run_id"],
++                "success": True,
++                "completed": 0,
++                "free_blocks": self.adapter.free_count(),
++                "timestamp": time.monotonic(),
++            },
++        )
++        self._save_totals()
++
++    def close(self) -> None:
++        self._save_totals()
++        for stream in self.files.values():
++            stream.close()
++
++
++def _configuration(scheduler, mode: str, log_dir: str) -> dict[str, Any]:
++    if os.environ.get("VLLM_USE_FLASHINFER_SAMPLER") != "0":
++        raise ValueError(
++            "Set VLLM_USE_FLASHINFER_SAMPLER=0 explicitly for both experiment modes"
++        )
++    from vllm import envs
++
++    use_flashinfer_sampler = envs.VLLM_USE_FLASHINFER_SAMPLER
++    if use_flashinfer_sampler is not False:
++        raise ValueError(
++            "VLLM_USE_FLASHINFER_SAMPLER resolved enabled; restart with it set to 0"
++        )
++    config = scheduler.vllm_config
++    parallel = config.parallel_config
++    cache = config.cache_config
++    groups = scheduler.kv_cache_config.kv_cache_groups
++    reasons = []
++    if config.scheduler_config.async_scheduling or config.max_concurrent_batches != 1:
++        reasons.append(
++            "synchronous scheduling with max_concurrent_batches=1 is required"
++        )
++    if config.kv_transfer_config is not None or config.ec_transfer_config is not None:
++        reasons.append("KV/EC transfer connectors are unsupported")
++    if getattr(cache, "kv_offloading_size", None):
++        reasons.append("KV offloading is unsupported")
++    if config.speculative_config is not None:
++        reasons.append("speculative decoding is unsupported")
++    if not cache.enable_prefix_caching:
++        reasons.append("prefix caching must remain enabled")
++    if any(
++        getattr(parallel, key, 1) != 1
++        for key in (
++            "tensor_parallel_size",
++            "pipeline_parallel_size",
++            "data_parallel_size",
++            "decode_context_parallel_size",
++            "prefill_context_parallel_size",
++        )
++    ):
++        reasons.append("the prototype requires one GPU and one engine")
++    if len(groups) != 1:
++        reasons.append("exactly one KV cache group is supported")
++    else:
++        spec = groups[0].kv_cache_spec
++        specs = getattr(spec, "kv_cache_specs", {"single": spec}).values()
++        if any(
++            type(item).__name__ != "FullAttentionSpec"
++            or getattr(item, "sliding_window", None) is not None
++            or getattr(item, "attention_chunk_size", None) is not None
++            or getattr(item, "non_causal", False)
++            for item in specs
++        ):
++            reasons.append(
++                "only causal full attention with no sliding window is supported"
++            )
++        if spec.block_size != scheduler.hash_block_size:
++            reasons.append("hash_block_size must equal physical block_size")
++    if scheduler.is_encoder_decoder or scheduler.is_mm_encoder_only:
++        reasons.append("text decoder-only requests are required")
++    if not config.model_config.enforce_eager:
++        reasons.append("CUDA Graph must be disabled with enforce_eager")
++    backend = str(getattr(config.attention_config, "backend", ""))
++    if backend in ("", "None"):
++        reasons.append(
++            "an explicit verified non-FlashInfer attention backend is required"
++        )
++    if "FLASHINFER" in backend.upper():
++        reasons.append("FlashInfer is excluded from this experiment")
++    if reasons:
++        raise ValueError(
++            "Unsafe progressive experiment configuration: " + "; ".join(reasons)
++        )
++
++    import vllm
++
++    paths = {}
++    hashes = {}
++    for name in (
++        "sched.scheduler",
++        "kv_cache_manager",
++        "block_pool",
++        "progressive_policy",
++        "progressive_runtime",
++    ):
++        module = sys.modules.get("vllm.v1.core." + name)
++        filename = getattr(module, "__file__", None)
++        paths[name] = filename
++        if filename:
++            hashes[name] = hashlib.sha256(Path(filename).read_bytes()).hexdigest()
++    gpu_name = None
++    try:
++        from vllm.platforms import current_platform
++
++        gpu_name = current_platform.get_device_name()
++    except Exception:
++        pass
++    return {
++        "run_id": os.environ.get("VLLM_PE_RUN_ID", "unspecified"),
++        "mode": mode,
++        "policy": mode,
++        "log_dir": str(Path(log_dir).resolve()),
++        "check_interval": int(os.environ.get("VLLM_PE_CHECK_INTERVAL", "10")),
++        "first_cold_ratio": float(os.environ.get("VLLM_PE_FIRST_COLD_RATIO", ".2")),
++        "later_cold_ratio": float(os.environ.get("VLLM_PE_LATER_COLD_RATIO", ".4")),
++        "private_suffix_only": True,
++        "python": sys.executable,
++        "pid": os.getpid(),
++        "version": vllm.__version__,
++        "core_paths": paths,
++        "core_sha256": hashes,
++        "num_gpu_blocks": scheduler.kv_cache_config.num_blocks,
++        "block_size": groups[0].kv_cache_spec.block_size,
++        "hash_block_size": scheduler.hash_block_size,
++        "gpu_name": gpu_name,
++        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
++        "model": config.model_config.model,
++        "max_model_len": config.model_config.max_model_len,
++        "dtype": str(config.model_config.dtype),
++        "kv_cache_dtype": str(cache.cache_dtype),
++        "gpu_memory_utilization": cache.gpu_memory_utilization,
++        "prefix_caching": cache.enable_prefix_caching,
++        "attention_backend": backend,
++        "use_flashinfer_sampler": use_flashinfer_sampler,
++        "enforce_eager": config.model_config.enforce_eager,
++        "async_scheduling": config.scheduler_config.async_scheduling,
++        "max_concurrent_batches": config.max_concurrent_batches,
++        "max_num_seqs": config.scheduler_config.max_num_seqs,
++        "max_num_batched_tokens": config.scheduler_config.max_num_batched_tokens,
++        "max_num_scheduled_tokens": config.scheduler_config.max_num_scheduled_tokens,
++        "enable_chunked_prefill": config.scheduler_config.enable_chunked_prefill,
++        "seed": config.model_config.seed,
++        "timestamp": time.monotonic(),
++    }
++
++
++def create_runtime(scheduler) -> ProgressiveRuntime | None:
++    mode = os.environ.get("VLLM_PE_POLICY", "native")
++    if mode not in ("native", "progressive"):
++        raise ValueError("VLLM_PE_POLICY must be native or progressive")
++    log_dir = os.environ.get("VLLM_PE_LOG_DIR")
++    if not log_dir and mode == "native":
++        return None
++    if not log_dir:
++        raise ValueError("VLLM_PE_LOG_DIR is required for progressive mode")
++    return ProgressiveRuntime(scheduler, _configuration(scheduler, mode, log_dir))
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 83ed597..d5f28cc 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -383,6 +383,12 @@ class Scheduler(SchedulerInterface):
+         # async KV loads). Their remaining-block reservation gates async loads.
+         self._inflight_prefills: set[Request] = set()
+ 
++        from vllm.v1.core.progressive_runtime import create_runtime
++
++        self.progressive_runtime = create_runtime(self)
++        self.kv_cache_manager.progressive_runtime = self.progressive_runtime
++        self.kv_cache_manager.block_pool.progressive_runtime = self.progressive_runtime
++
+     def _mamba_block_aligned_split(
+         self,
+         request: Request,
+@@ -499,6 +505,8 @@ class Scheduler(SchedulerInterface):
+         return max(num_new_tokens, 0)
+ 
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
++        if self.progressive_runtime is not None:
++            self.progressive_runtime.maybe_check()
+         self.current_step += 1
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+@@ -1181,6 +1189,10 @@ class Scheduler(SchedulerInterface):
+                 input_budget -= num_new_tokens + draft_slots
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
++                if self.progressive_runtime is not None:
++                    self.progressive_runtime.on_admit(
++                        request, num_new_local_computed_tokens
++                    )
+                 if pad_spec_decode:
+                     assert num_new_tokens == 1 + self.num_spec_tokens
+                     scheduled_spec_decode_tokens[request_id] = [
+@@ -1938,6 +1950,12 @@ class Scheduler(SchedulerInterface):
+                     )
+ 
+             # Free encoder inputs only after the step has actually executed.
++            if self.progressive_runtime is not None and not output_is_stale:
++                self.progressive_runtime.on_computed(
++                    request,
++                    self.kv_cache_manager.get_blocks(req_id).blocks,
++                    request.num_computed_tokens - request.num_in_flight_tokens,
++                )
+             if request.has_encoder_inputs:
+                 self._free_encoder_inputs(request)
+ 
+@@ -2481,6 +2499,8 @@ class Scheduler(SchedulerInterface):
+         self, request: Request, delay_free_blocks: bool = False
+     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+         assert request.is_finished()
++        if self.progressive_runtime is not None:
++            self.progressive_runtime.on_finish(request)
+ 
+         self._inflight_prefills.discard(request)
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+@@ -2641,6 +2661,9 @@ class Scheduler(SchedulerInterface):
+         if reset_connector:
+             reset_successful = self.reset_connector_cache() and reset_successful
+ 
++        if reset_successful and self.progressive_runtime is not None:
++            self.progressive_runtime.reset()
++
+         return reset_successful
+ 
+     def reset_connector_cache(self) -> bool:
+@@ -2732,6 +2755,8 @@ class Scheduler(SchedulerInterface):
+ 
+     def shutdown(self) -> None:
+         logger.debug_once("[shutdown] Scheduler: start")
++        if self.progressive_runtime is not None:
++            self.progressive_runtime.close()
+         if self.kv_event_publisher:
+             self.kv_event_publisher.shutdown()
+         if self.connector is not None:

@@ -1,0 +1,32 @@
+
+# Local tools and generated files
+.DS_Store
+__pycache__/
+*.pyc
+/.tools/
+/dist/
+
+# Full replay inputs stay local; retain selection IDs, hashes and small reports.
+/results/manifest_50.json
+/results/calibration_*.json
+!/results/calibration_selection*.json
+!/results/calibration_*.selection.json
+!/results/calibration_*.preflight.json
+/.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local artifacts and credentials
+/audit/
+/results/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
+.env
+.env.
+.pem
+*.key

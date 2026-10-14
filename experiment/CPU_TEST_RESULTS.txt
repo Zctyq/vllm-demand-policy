@@ -1,0 +1,20 @@
+test_actual_engine_paths_build_configuration_and_fresh_reset_required (test_replay.ReplayTests.test_actual_engine_paths_build_configuration_and_fresh_reset_required) ... ok
+test_causal_cap_all_arrive_t0_and_fixed_followup_inputs (test_replay.ReplayTests.test_causal_cap_all_arrive_t0_and_fixed_followup_inputs) ... ok
+test_eviction_summary_validates_free_count_and_real_counts (test_replay.ReplayTests.test_eviction_summary_validates_free_count_and_real_counts) ... ok
+test_exact_capacity_guard (test_replay.ReplayTests.test_exact_capacity_guard) ... ok
+test_failure_invalidates_equal_work_comparison (test_replay.ReplayTests.test_failure_invalidates_equal_work_comparison) ... ok
+test_fixed_payload_no_cache_salt_and_no_prompt_identity (test_replay.ReplayTests.test_fixed_payload_no_cache_salt_and_no_prompt_identity) ... ok
+test_gap_units_reject_invalid_and_first_gap_not_applied (test_replay.ReplayTests.test_gap_units_reject_invalid_and_first_gap_not_applied) ... ok
+test_history_joins_engine_adopted_hits_no_global_or_adjacent_lcp_proxy (test_replay.ReplayTests.test_history_joins_engine_adopted_hits_no_global_or_adjacent_lcp_proxy) ... ok
+test_metadata_survives_engine_wrappers_unicode_and_greedy_suffix (test_replay.ReplayTests.test_metadata_survives_engine_wrappers_unicode_and_greedy_suffix) ... ok
+test_pair_plan_alternates_and_rejects_changed_workload (test_replay.ReplayTests.test_pair_plan_alternates_and_rejects_changed_workload) ... ok
+test_real_lengths_and_response_token_ids_required (test_replay.ReplayTests.test_real_lengths_and_response_token_ids_required) ... ok
+test_reference_hash_or_gap_mismatch_fails_without_resampling (test_replay.ReplayTests.test_reference_hash_or_gap_mismatch_fails_without_resampling) ... ok
+test_reference_preserves_fixed_order_and_original_rows (test_replay.ReplayTests.test_reference_preserves_fixed_order_and_original_rows) ... ok
+test_whole_sessions_calls_not_message_count_and_no_truncation (test_replay.ReplayTests.test_whole_sessions_calls_not_message_count_and_no_truncation) ... ok
+test_zero_eviction_and_absent_pressure_qualify_without_fabricating_success (test_replay.ReplayTests.test_zero_eviction_and_absent_pressure_qualify_without_fabricating_success) ... ok
+
+----------------------------------------------------------------------
+Ran 15 tests in 0.082s
+
+OK

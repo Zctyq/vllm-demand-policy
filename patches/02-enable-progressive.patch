@@ -1,0 +1,16 @@
+diff --git a/vllm/v1/core/progressive_runtime.py b/vllm/v1/core/progressive_runtime.py
+index 149842a..35f66f5 100644
+--- a/vllm/v1/core/progressive_runtime.py
++++ b/vllm/v1/core/progressive_runtime.py
+@@ -473,11 +473,6 @@ def create_runtime(scheduler) -> ProgressiveRuntime | None:
+     mode = os.environ.get("VLLM_PE_POLICY", "native")
+     if mode not in ("native", "progressive"):
+         raise ValueError("VLLM_PE_POLICY must be native or progressive")
+-    if mode == "progressive":
+-        raise ValueError(
+-            "Observation-only build: use VLLM_PE_POLICY=native; "
+-            "apply 02-enable-progressive.patch before enabling progressive"
+-        )
+     log_dir = os.environ.get("VLLM_PE_LOG_DIR")
+     if not log_dir and mode == "native":
+         return None

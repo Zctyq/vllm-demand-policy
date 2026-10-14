@@ -1,0 +1,18 @@
+{
+  "python": null,
+  "overlay_site": null,
+  "model": null,
+  "served_model_name": "qwen25-7b",
+  "gpu": null,
+  "port": 18080,
+  "dtype": null,
+  "max_model_len": null,
+  "block_size": null,
+  "num_gpu_blocks": null,
+  "max_num_batched_tokens": null,
+  "max_num_seqs": null,
+  "enable_chunked_prefill": null,
+  "attention_backend": null,
+  "seed": null,
+  "gpu_memory_utilization": null
+}

@@ -1,0 +1,32 @@
+[
+  {
+    "run_index": 1,
+    "seed": 17,
+    "policy": "native"
+  },
+  {
+    "run_index": 2,
+    "seed": 17,
+    "policy": "progressive"
+  },
+  {
+    "run_index": 3,
+    "seed": 29,
+    "policy": "progressive"
+  },
+  {
+    "run_index": 4,
+    "seed": 29,
+    "policy": "native"
+  },
+  {
+    "run_index": 5,
+    "seed": 43,
+    "policy": "native"
+  },
+  {
+    "run_index": 6,
+    "seed": 43,
+    "policy": "progressive"
+  }
+]

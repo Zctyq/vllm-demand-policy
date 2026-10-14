@@ -1,0 +1,29 @@
+Local export: /Users/zhangtianqi/Downloads/lmcache_50_audit
+Checked on: 2026-10-03 Asia/Shanghai
+
+Available evidence and exact scope:
+1. replay_concurrent.py prepare() line 142 sets the first call gap to 0,
+   then records float(row['pre_gap']) without scaling for later calls.
+2. replay() line 297 waits until previous_end + c['pre_gap']; until()
+   compares this deadline with time.monotonic(), whose unit is seconds.
+3. The original script labels the saved field pre_gap_seconds and prints
+   the sum as seconds. The new replay preserves this existing convention:
+   previous local response completes, wait pre_gap seconds, submit the next
+   full trace input. The first call has no prior response and no gap wait.
+4. requests.jsonl contains explicit call indices, strictly 1..N within each
+   session. These, session_id and original_dataset_row match the original
+   manifest. Use --order-field call for an explicit ordering rule.
+5. All 1090 raw gaps are finite and nonnegative; all 50 first gaps are 0.
+   Range: 0..68.6134. Sum excluding first calls: 1410.5703 seconds under
+   the original replay convention.
+
+Limitation:
+The export contains no upstream timing schema or source timestamps. These
+files establish how the original experiment interprets pre_gap; they do
+not independently establish LMCache's upstream field definition. The new
+experiment reproduces the supplied original script's seconds convention.
+This limitation is retained in results/export_audit/audit.json.
+
+Source file SHA256 values and all token/manifest comparisons are recorded
+in results/export_audit/audit.json and token_checks.csv. Original export
+files are not edited by the audit or prepare commands.
